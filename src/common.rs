@@ -1059,12 +1059,67 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 
 pub fn check_software_update() {
     if is_custom_client() {
+        // Relies: eigen update-check naar de Relies-updateserver.
+        std::thread::spawn(move || {
+            if let Err(e) = check_relies_update() {
+                log::debug!("Relies update-check mislukt: {e}");
+            }
+        });
         return;
     }
     let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
     if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
         std::thread::spawn(move || allow_err!(do_check_software_update()));
     }
+}
+
+// Relies auto-update: haalt version.json op, vergelijkt de versie, en bij een
+// nieuwere versie wordt de installer gedownload, de SHA256 gecontroleerd en
+// stil uitgevoerd. De hash-controle voorkomt dat er een vervalst bestand draait.
+const RELIES_UPDATE_URL: &str = "https://softwareupdate.relies.eu/relies/version.json";
+
+#[cfg(windows)]
+fn check_relies_update() -> hbb_common::ResultType<()> {
+    use sha2::{Digest, Sha256};
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let txt = client.get(RELIES_UPDATE_URL).send()?.text()?;
+    let v: serde_json::Value = serde_json::from_str(&txt)?;
+    let latest = v["version"].as_str().unwrap_or("").trim().to_string();
+    let url = v["url"].as_str().unwrap_or("").trim().to_string();
+    let sha = v["sha256"].as_str().unwrap_or("").trim().to_lowercase();
+    if latest.is_empty() || url.is_empty() || sha.len() != 64 {
+        return Ok(());
+    }
+    if hbb_common::get_version_number(&latest) <= hbb_common::get_version_number(crate::VERSION) {
+        return Ok(());
+    }
+    log::info!("Relies: nieuwe versie {latest} beschikbaar, downloaden...");
+    let bytes = client.get(&url).send()?.bytes()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let got: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    if got != sha {
+        log::error!("Relies update: SHA256 komt niet overeen, update afgebroken");
+        return Ok(());
+    }
+    let tmp = std::env::temp_dir().join("Relies-Hulp-op-Afstand-Update.exe");
+    std::fs::write(&tmp, &bytes)?;
+    log::info!("Relies: installer stil uitvoeren");
+    std::process::Command::new(&tmp)
+        .args(["/VERYSILENT", "/NORESTART"])
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn check_relies_update() -> hbb_common::ResultType<()> {
+    Ok(())
 }
 
 pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String> {
